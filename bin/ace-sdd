@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# ace-sdd — install SDD+ACE harness into brownfield, or init a greenfield project.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCAFFOLD="$ROOT/scaffold"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ace-sdd install <target-dir> [--force] [--merge-agents]
+  ace-sdd init <path> [--lang go|none] [--module <go-module>] [--force]
+
+Commands:
+  install   Copy harness into an existing (brownfield) repository.
+  init      Create a new project directory with harness (+ optional language stub).
+
+Options:
+  --force         Overwrite existing harness files (keeps backup *.bak.<timestamp>).
+  --merge-agents  On install, if AGENTS.md exists, append ace-sdd section instead of
+                  replacing (default: write AGENTS.md.ace-sdd when conflict).
+  --lang          Greenfield only: none (default) | go
+  --module        Go module path (default: github.com/example/<dirname>)
+
+Examples:
+  ace-sdd install ~/repo/my-service
+  ace-sdd init ~/repo/new-app --lang go --module github.com/me/new-app
+EOF
+}
+
+ts() { date +%Y%m%d%H%M%S; }
+
+backup_if_exists() {
+  local f="$1"
+  if [[ -e "$f" ]]; then
+    local b="${f}.bak.$(ts)"
+    cp -R "$f" "$b"
+    echo "backup: $b"
+  fi
+}
+
+copy_tree() {
+  # copy_tree SRC_DIR DEST_DIR
+  local src="$1" dest="$2" force="${3:-0}"
+  mkdir -p "$dest"
+  # Use tar to preserve structure; portable.
+  (
+    cd "$src"
+    tar cf - .
+  ) | (
+    cd "$dest"
+    tar xf -
+  )
+}
+
+merge_gitignore() {
+  local dest="$1"
+  local frag="$SCAFFOLD/.gitignore.ace-sdd"
+  local gi="$dest/.gitignore"
+  if [[ ! -f "$frag" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$gi" ]]; then
+    cp "$frag" "$gi"
+    echo "wrote .gitignore"
+    return 0
+  fi
+  if grep -q 'ace-sdd-kit: session artifacts' "$gi" 2>/dev/null; then
+    echo ".gitignore already contains ace-sdd rules"
+    return 0
+  fi
+  {
+    echo ""
+    echo "# --- ace-sdd-kit ---"
+    cat "$frag"
+  } >>"$gi"
+  echo "appended ace-sdd rules to .gitignore"
+}
+
+install_harness() {
+  local dest="$1" force="$2" merge_agents="$3"
+  if [[ ! -d "$dest" ]]; then
+    echo "error: target directory does not exist: $dest" >&2
+    exit 1
+  fi
+  dest="$(cd "$dest" && pwd)"
+
+  local paths=(
+    harness
+    docs
+    thoughts
+    .cursor/skills
+    .claude/commands
+    CLAUDE.md
+  )
+
+  for rel in "${paths[@]}"; do
+    local src="$SCAFFOLD/$rel"
+    local out="$dest/$rel"
+    if [[ -e "$out" && "$force" -ne 1 ]]; then
+      echo "skip existing (use --force): $rel"
+      continue
+    fi
+    if [[ -e "$out" && "$force" -eq 1 ]]; then
+      backup_if_exists "$out"
+      rm -rf "$out"
+    fi
+    mkdir -p "$(dirname "$out")"
+    if [[ -d "$src" ]]; then
+      mkdir -p "$out"
+      copy_tree "$src" "$out"
+    else
+      cp "$src" "$out"
+    fi
+    echo "installed $rel"
+  done
+
+  # AGENTS.md conflict handling
+  if [[ -f "$dest/AGENTS.md" && "$force" -ne 1 ]]; then
+    if [[ "$merge_agents" -eq 1 ]]; then
+      if grep -q 'Agent harness: SDD + ACE' "$dest/AGENTS.md" 2>/dev/null; then
+        echo "AGENTS.md already contains ace-sdd block"
+      else
+        {
+          echo ""
+          echo ""
+          echo "<!-- begin ace-sdd-kit -->"
+          cat "$SCAFFOLD/AGENTS.md"
+          echo "<!-- end ace-sdd-kit -->"
+        } >>"$dest/AGENTS.md"
+        echo "appended ace-sdd harness to AGENTS.md"
+      fi
+    else
+      cp "$SCAFFOLD/AGENTS.md" "$dest/AGENTS.md.ace-sdd"
+      echo "wrote AGENTS.md.ace-sdd (existing AGENTS.md preserved; merge manually or re-run with --merge-agents / --force)"
+    fi
+  else
+    if [[ -f "$dest/AGENTS.md" && "$force" -eq 1 ]]; then
+      backup_if_exists "$dest/AGENTS.md"
+    fi
+    cp "$SCAFFOLD/AGENTS.md" "$dest/AGENTS.md"
+    echo "installed AGENTS.md"
+  fi
+
+  # ensure gitkeeps
+  mkdir -p "$dest/thoughts/shared/"{research,plans,progress}
+  touch "$dest/thoughts/shared/research/.gitkeep" \
+    "$dest/thoughts/shared/plans/.gitkeep" \
+    "$dest/thoughts/shared/progress/.gitkeep"
+  [[ -f "$dest/docs/specs/_TEMPLATE.md" ]] || cp "$SCAFFOLD/docs/specs/_TEMPLATE.md" "$dest/docs/specs/_TEMPLATE.md"
+  [[ -f "$dest/docs/specs/README.md" ]] || cp "$SCAFFOLD/docs/specs/README.md" "$dest/docs/specs/README.md"
+
+  merge_gitignore "$dest"
+
+  if [[ ! -f "$dest/ACE-SDD.md" ]]; then
+    cat >"$dest/ACE-SDD.md" <<EOF
+# SDD + ACE harness installed
+
+From: ace-sdd-kit
+
+- Rules: [AGENTS.md](AGENTS.md) (or merge from AGENTS.md.ace-sdd)
+- Specs: [docs/specs/](docs/specs/)
+- Prompts: [harness/prompts/](harness/prompts/)
+- **Start here:** Cursor skill \`start-change\` or Claude \`/start_change\`
+- Then: draft_spec → research (brownfield) → create_plan → implement_plan
+- Compaction: compact_session when context is noisy
+
+Workflow graph + toy examples: [docs/workflow.md](docs/workflow.md)
+EOF
+    echo "wrote ACE-SDD.md"
+  fi
+
+  echo "OK: harness installed into $dest"
+}
+
+init_go() {
+  local dest="$1" name="$2" module="$3"
+  local lang="$ROOT/langs/go"
+  sed "s|{{MODULE}}|$module|g" "$lang/go.mod.tmpl" >"$dest/go.mod"
+  sed "s|{{NAME}}|$name|g" "$lang/main.go.tmpl" >"$dest/main.go"
+  cp "$lang/Makefile" "$dest/Makefile"
+  cp "$lang/main_test.go" "$dest/main_test.go"
+  echo "seeded Go stub (module $module)"
+}
+
+cmd_install() {
+  local dest="" force=0 merge_agents=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --merge-agents) merge_agents=1; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *)
+        if [[ -z "$dest" ]]; then dest="$1"; shift; else echo "unexpected: $1" >&2; exit 1; fi
+        ;;
+    esac
+  done
+  [[ -n "$dest" ]] || { usage; exit 1; }
+  install_harness "$dest" "$force" "$merge_agents"
+}
+
+cmd_init() {
+  local dest="" force=0 lang=none module=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=1; shift ;;
+      --lang) lang="$2"; shift 2 ;;
+      --module) module="$2"; shift 2 ;;
+      -h|--help) usage; exit 0 ;;
+      *)
+        if [[ -z "$dest" ]]; then dest="$1"; shift; else echo "unexpected: $1" >&2; exit 1; fi
+        ;;
+    esac
+  done
+  [[ -n "$dest" ]] || { usage; exit 1; }
+
+  if [[ -e "$dest" ]]; then
+    if [[ "$force" -ne 1 ]]; then
+      echo "error: path exists (use --force): $dest" >&2
+      exit 1
+    fi
+    backup_if_exists "$dest"
+    rm -rf "$dest"
+  fi
+  mkdir -p "$dest"
+  dest="$(cd "$dest" && pwd)"
+  local name
+  name="$(basename "$dest")"
+  if [[ -z "$module" ]]; then
+    module="github.com/example/$name"
+  fi
+
+  install_harness "$dest" 1 0
+
+  case "$lang" in
+    none) ;;
+    go) init_go "$dest" "$name" "$module" ;;
+    *) echo "error: unknown --lang $lang (none|go)" >&2; exit 1 ;;
+  esac
+
+  if [[ ! -d "$dest/.git" ]]; then
+    (cd "$dest" && git init -q)
+    echo "git init"
+  fi
+
+  cat >"$dest/README.md" <<EOF
+# $name
+
+Greenfield project scaffolded with **ace-sdd-kit** (SDD + ACE).
+
+## Start here
+
+1. Read [AGENTS.md](AGENTS.md) and [ACE-SDD.md](ACE-SDD.md)
+2. Draft first spec: Cursor skill \`draft-spec\` or Claude \`/draft_spec\`
+3. Greenfield: research may be waived until code exists; then always research on brownfield changes
+4. Plan → implement with verification commands
+
+EOF
+  if [[ "$lang" == "go" ]]; then
+    cat >>"$dest/README.md" <<'EOF'
+## Go
+
+```bash
+make test
+make run
+```
+EOF
+  fi
+
+  echo "OK: greenfield project at $dest"
+}
+
+main() {
+  local cmd="${1:-}"
+  shift || true
+  case "$cmd" in
+    install) cmd_install "$@" ;;
+    init) cmd_init "$@" ;;
+    -h|--help|help|"") usage; [[ -n "$cmd" ]] || exit 1 ;;
+    *) echo "unknown command: $cmd" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"

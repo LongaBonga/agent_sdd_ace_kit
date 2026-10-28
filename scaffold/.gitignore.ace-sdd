@@ -1,0 +1,8 @@
+# ace-sdd-kit: session artifacts (keep directories)
+thoughts/shared/research/*
+!thoughts/shared/research/.gitkeep
+thoughts/shared/plans/*
+!thoughts/shared/plans/.gitkeep
+thoughts/shared/progress/*
+!thoughts/shared/progress/.gitkeep
+thoughts/local/
